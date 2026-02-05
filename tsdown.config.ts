@@ -6,13 +6,11 @@ const env = {
 
 export default defineConfig([
   {
-    entry: "src/index.ts",
-    env,
-    fixedExtension: false,
-    platform: "node",
-  },
-  {
-    entry: "src/entry.ts",
+    entry: {
+      index: "src/index.ts",
+      entry: "src/entry.ts",
+      extensionAPI: "src/extensionAPI.ts",
+    },
     env,
     fixedExtension: false,
     platform: "node",
@@ -21,12 +19,6 @@ export default defineConfig([
     dts: true,
     entry: "src/plugin-sdk/index.ts",
     outDir: "dist/plugin-sdk",
-    env,
-    fixedExtension: false,
-    platform: "node",
-  },
-  {
-    entry: "src/extensionAPI.ts",
     env,
     fixedExtension: false,
     platform: "node",
