@@ -61,15 +61,23 @@
 - TypeScript checks: `pnpm tsgo`
 - Lint/format: `pnpm check`
 - Tests: `pnpm test` (vitest); coverage: `pnpm test:coverage`
+- **Single test**: `vitest run path/to/test.test.ts` or `pnpm test path/to/test.test.ts`
+- **Watch mode**: `pnpm test:watch` (auto-runs on file changes)
+- **E2E tests**: `pnpm test:e2e` (end-to-end integration tests)
+- **Live tests**: `pnpm test:live` (requires real API keys)
 
 ## Coding Style & Naming Conventions
 
 - Language: TypeScript (ESM). Prefer strict typing; avoid `any`.
+- Imports: Use `.js` extensions for all imports (ESM convention). Group imports: external libs first, then internal modules.
 - Formatting/linting via Oxlint and Oxfmt; run `pnpm check` before commits.
 - Add brief code comments for tricky or non-obvious logic.
-- Keep files concise; extract helpers instead of “V2” copies. Use existing patterns for CLI options and dependency injection via `createDefaultDeps`.
+- Keep files concise; extract helpers instead of "V2" copies. Use existing patterns for CLI options and dependency injection via `createDefaultDeps`.
 - Aim to keep files under ~700 LOC; guideline only (not a hard guardrail). Split/refactor when it improves clarity or testability.
 - Naming: use **OpenClaw** for product/app/docs headings; use `openclaw` for CLI command, package/binary, paths, and config keys.
+- Error handling: Use proper error types with typed properties. Throw meaningful errors with context.
+- Types: Prefer `const assertions` for readonly arrays, use `unknown` over `any`, leverage utility types.
+- Async: Always use `await` in try/catch blocks, avoid unhandled promise rejections.
 
 ## Release Channels (Naming)
 
