@@ -8,6 +8,16 @@ import {
   stopLaunchAgent,
   uninstallLaunchAgent,
 } from "./launchd.js";
+import { execFileSync } from "node:child_process";
+import {
+  installRegistryTask,
+  isRegistryTaskInstalled,
+  readRegistryTaskCommand,
+  readRegistryTaskRuntime,
+  restartRegistryTask,
+  stopRegistryTask,
+  uninstallRegistryTask,
+} from "./registry.js";
 import {
   installScheduledTask,
   isScheduledTaskInstalled,
@@ -26,6 +36,18 @@ import {
   stopSystemdService,
   uninstallSystemdService,
 } from "./systemd.js";
+
+function isAdmin(): boolean {
+  if (process.platform !== "win32") {
+    return false;
+  }
+  try {
+    execFileSync("net", ["session"], { stdio: "ignore", windowsHide: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export type GatewayServiceInstallArgs = {
   env: Record<string, string | undefined>;
@@ -124,30 +146,53 @@ export function resolveGatewayService(): GatewayService {
 
   if (process.platform === "win32") {
     return {
-      label: "Scheduled Task",
+      label: "Background Task",
       loadedText: "registered",
       notLoadedText: "missing",
       install: async (args) => {
-        await installScheduledTask(args);
+        if (isAdmin()) {
+          await installScheduledTask(args);
+        } else {
+          await installRegistryTask(args);
+        }
       },
       uninstall: async (args) => {
-        await uninstallScheduledTask(args);
+        await uninstallScheduledTask(args).catch(() => {});
+        await uninstallRegistryTask(args).catch(() => {});
       },
       stop: async (args) => {
-        await stopScheduledTask({
-          stdout: args.stdout,
-          env: args.env,
-        });
+        if (await isScheduledTaskInstalled({ env: args.env })) {
+          await stopScheduledTask({ stdout: args.stdout, env: args.env });
+        }
+        if (await isRegistryTaskInstalled({ env: args.env })) {
+          await stopRegistryTask({ stdout: args.stdout, env: args.env });
+        }
       },
       restart: async (args) => {
-        await restartScheduledTask({
-          stdout: args.stdout,
-          env: args.env,
-        });
+        if (await isScheduledTaskInstalled({ env: args.env })) {
+          await restartScheduledTask({ stdout: args.stdout, env: args.env });
+        } else if (await isRegistryTaskInstalled({ env: args.env })) {
+          await restartRegistryTask({ stdout: args.stdout, env: args.env });
+        } else {
+          throw new Error("Task not installed, please run install first.");
+        }
       },
-      isLoaded: async (args) => isScheduledTaskInstalled(args),
-      readCommand: readScheduledTaskCommand,
-      readRuntime: async (env) => await readScheduledTaskRuntime(env),
+      isLoaded: async (args) => {
+        const schInstalled = await isScheduledTaskInstalled(args);
+        const regInstalled = await isRegistryTaskInstalled(args);
+        return schInstalled || regInstalled;
+      },
+      readCommand: async (env) => {
+        const schCmd = await readScheduledTaskCommand(env);
+        if (schCmd) return schCmd;
+        return await readRegistryTaskCommand(env);
+      },
+      readRuntime: async (env) => {
+        if (await isScheduledTaskInstalled({ env })) {
+          return await readScheduledTaskRuntime(env);
+        }
+        return await readRegistryTaskRuntime(env);
+      },
     };
   }
 
