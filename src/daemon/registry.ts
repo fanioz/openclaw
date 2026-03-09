@@ -1,22 +1,23 @@
 import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
-import path from "node:path";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { promisify } from "node:util";
 import type { GatewayServiceRuntime } from "./service-runtime.js";
 import { colorize, isRich, theme } from "../terminal/theme.js";
 import { formatGatewayServiceDescription, resolveGatewayWindowsTaskName } from "./constants.js";
 import { resolveGatewayStateDir } from "./paths.js";
-import { parseKeyValueOutput } from "./runtime-parse.js";
 import { parseCommandLine } from "./utils.js";
 
 const execFileAsync = promisify(execFile);
+
+const REGISTRY_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 const formatLine = (label: string, value: string) => {
   const rich = isRich();
   return `${colorize(rich, theme.muted, `${label}:`)} ${colorize(rich, theme.command, value)}`;
 };
 
-function resolveTaskName(env: Record<string, string | undefined>): string {
+function resolveRegistryName(env: Record<string, string | undefined>): string {
   const override = env.OPENCLAW_WINDOWS_TASK_NAME?.trim();
   if (override) {
     return override;
@@ -34,6 +35,11 @@ export function resolveTaskScriptPath(env: Record<string, string | undefined>): 
   return path.join(stateDir, scriptName);
 }
 
+export function resolveVbsWrapperPath(env: Record<string, string | undefined>): string {
+  const stateDir = resolveGatewayStateDir(env);
+  return path.join(stateDir, "gateway_hidden.vbs");
+}
+
 function quoteCmdArg(value: string): string {
   if (!/[ \t"]/g.test(value)) {
     return value;
@@ -41,22 +47,7 @@ function quoteCmdArg(value: string): string {
   return `"${value.replace(/"/g, '\\"')}"`;
 }
 
-function resolveTaskUser(env: Record<string, string | undefined>): string | null {
-  const username = env.USERNAME || env.USER || env.LOGNAME;
-  if (!username) {
-    return null;
-  }
-  if (username.includes("\\")) {
-    return username;
-  }
-  const domain = env.USERDOMAIN;
-  if (domain) {
-    return `${domain}\\${username}`;
-  }
-  return username;
-}
-
-export async function readScheduledTaskCommand(env: Record<string, string | undefined>): Promise<{
+export async function readRegistryTaskCommand(env: Record<string, string | undefined>): Promise<{
   programArguments: string[];
   workingDirectory?: string;
   environment?: Record<string, string>;
@@ -110,30 +101,6 @@ export async function readScheduledTaskCommand(env: Record<string, string | unde
   }
 }
 
-export type ScheduledTaskInfo = {
-  status?: string;
-  lastRunTime?: string;
-  lastRunResult?: string;
-};
-
-export function parseSchtasksQuery(output: string): ScheduledTaskInfo {
-  const entries = parseKeyValueOutput(output, ":");
-  const info: ScheduledTaskInfo = {};
-  const status = entries.status;
-  if (status) {
-    info.status = status;
-  }
-  const lastRunTime = entries["last run time"];
-  if (lastRunTime) {
-    info.lastRunTime = lastRunTime;
-  }
-  const lastRunResult = entries["last run result"];
-  if (lastRunResult) {
-    info.lastRunResult = lastRunResult;
-  }
-  return info;
-}
-
 function buildTaskScript({
   description,
   programArguments,
@@ -165,11 +132,16 @@ function buildTaskScript({
   return `${lines.join("\r\n")}\r\n`;
 }
 
-async function execSchtasks(
+function buildVbsWrapper(scriptPath: string): string {
+  // 0 = hidden window
+  return `Set WshShell = CreateObject("WScript.Shell")\nWshShell.Run """${scriptPath}""", 0, False\n`;
+}
+
+async function execReg(
   args: string[],
 ): Promise<{ stdout: string; stderr: string; code: number }> {
   try {
-    const { stdout, stderr } = await execFileAsync("schtasks", args, {
+    const { stdout, stderr } = await execFileAsync("reg", args, {
       encoding: "utf8",
       windowsHide: true,
     });
@@ -194,16 +166,15 @@ async function execSchtasks(
   }
 }
 
-async function assertSchtasksAvailable() {
-  const res = await execSchtasks(["/Query"]);
-  if (res.code === 0) {
-    return;
-  }
-  const detail = res.stderr || res.stdout;
-  throw new Error(`schtasks unavailable: ${detail || "unknown error"}`.trim());
+export async function isRegistryTaskInstalled(args: {
+  env?: Record<string, string | undefined>;
+}): Promise<boolean> {
+  const taskName = resolveRegistryName(args.env ?? (process.env as Record<string, string | undefined>));
+  const res = await execReg(["query", REGISTRY_RUN_KEY, "/v", taskName]);
+  return res.code === 0;
 }
 
-export async function installScheduledTask({
+export async function installRegistryTask({
   env,
   stdout,
   programArguments,
@@ -218,15 +189,17 @@ export async function installScheduledTask({
   environment?: Record<string, string | undefined>;
   description?: string;
 }): Promise<{ scriptPath: string }> {
-  await assertSchtasksAvailable();
   const scriptPath = resolveTaskScriptPath(env);
+  const vbsPath = resolveVbsWrapperPath(env);
   await fs.mkdir(path.dirname(scriptPath), { recursive: true });
+
   const taskDescription =
     description ??
     formatGatewayServiceDescription({
       profile: env.OPENCLAW_PROFILE,
       version: environment?.OPENCLAW_SERVICE_VERSION ?? env.OPENCLAW_SERVICE_VERSION,
     });
+
   const script = buildTaskScript({
     description: taskDescription,
     programArguments,
@@ -235,53 +208,39 @@ export async function installScheduledTask({
   });
   await fs.writeFile(scriptPath, script, "utf8");
 
-  const taskName = resolveTaskName(env);
-  const quotedScript = quoteCmdArg(scriptPath);
-  const baseArgs = [
-    "/Create",
-    "/F",
-    "/SC",
-    "ONLOGON",
-    "/RL",
-    "LIMITED",
-    "/TN",
-    taskName,
-    "/TR",
-    quotedScript,
-  ];
-  const taskUser = resolveTaskUser(env);
-  let create = await execSchtasks(
-    taskUser ? [...baseArgs, "/RU", taskUser, "/NP", "/IT"] : baseArgs,
-  );
-  if (create.code !== 0 && taskUser) {
-    create = await execSchtasks(baseArgs);
-  }
+  const vbs = buildVbsWrapper(scriptPath);
+  await fs.writeFile(vbsPath, vbs, "utf8");
+
+  const taskName = resolveRegistryName(env);
+  // wscript.exe runs .vbs silently
+  const runCommand = `wscript.exe "${vbsPath}"`;
+
+  const create = await execReg(["add", REGISTRY_RUN_KEY, "/v", taskName, "/t", "REG_SZ", "/d", runCommand, "/f"]);
+
   if (create.code !== 0) {
     const detail = create.stderr || create.stdout;
-    const hint = /access is denied/i.test(detail)
-      ? " Run PowerShell as Administrator or rerun without installing the daemon."
-      : "";
-    throw new Error(`schtasks create failed: ${detail}${hint}`.trim());
+    throw new Error(`Registry run key create failed: ${detail}`.trim());
   }
 
-  await execSchtasks(["/Run", "/TN", taskName]);
-  // Ensure we don't end up writing to a clack spinner line (wizards show progress without a newline).
+  // Also start it now
+  await execFileAsync("wscript.exe", [vbsPath], { windowsHide: true });
+
   stdout.write("\n");
-  stdout.write(`${formatLine("Installed Scheduled Task", taskName)}\n`);
+  stdout.write(`${formatLine("Installed Registry User Task", taskName)}\n`);
   stdout.write(`${formatLine("Task script", scriptPath)}\n`);
+  stdout.write(`${formatLine("Wrapper script", vbsPath)}\n`);
   return { scriptPath };
 }
 
-export async function uninstallScheduledTask({
+export async function uninstallRegistryTask({
   env,
   stdout,
 }: {
   env: Record<string, string | undefined>;
   stdout: NodeJS.WritableStream;
 }): Promise<void> {
-  await assertSchtasksAvailable();
-  const taskName = resolveTaskName(env);
-  await execSchtasks(["/Delete", "/F", "/TN", taskName]);
+  const taskName = resolveRegistryName(env);
+  await execReg(["delete", REGISTRY_RUN_KEY, "/v", taskName, "/f"]);
 
   const scriptPath = resolveTaskScriptPath(env);
   try {
@@ -290,84 +249,111 @@ export async function uninstallScheduledTask({
   } catch {
     stdout.write(`Task script not found at ${scriptPath}\n`);
   }
+
+  const vbsPath = resolveVbsWrapperPath(env);
+  try {
+    await fs.unlink(vbsPath);
+    stdout.write(`${formatLine("Removed wrapper script", vbsPath)}\n`);
+  } catch {
+    // Ignore
+  }
 }
 
-function isTaskNotRunning(res: { stdout: string; stderr: string; code: number }): boolean {
-  const detail = (res.stderr || res.stdout).toLowerCase();
-  return detail.includes("not running");
+// Windows doesn't make it easy to map a process to the exact registry run key that started it
+// without WMI. We'll do a best-effort check if `node.exe` with our CLI args is running.
+async function getRunningProcessIds(env: Record<string, string | undefined>): Promise<number[]> {
+  try {
+    const { stdout } = await execFileAsync("wmic", [
+      "process",
+      "where",
+      "name='node.exe'",
+      "get",
+      "ProcessId,CommandLine",
+    ], { windowsHide: true });
+
+    const lines = stdout.split(/\r?\n/);
+    const pids: number[] = [];
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      // Very naive check: does the command line contain "openclaw gateway"?
+      if (line.toLowerCase().includes("gateway") && line.toLowerCase().includes("openclaw")) {
+         // wmic output puts ProcessId at the end usually
+         const parts = line.trim().split(/\s+/);
+         const pid = parseInt(parts[parts.length - 1], 10);
+         if (!isNaN(pid)) {
+           pids.push(pid);
+         }
+      }
+    }
+    return pids;
+  } catch {
+    return [];
+  }
 }
 
-export async function stopScheduledTask({
+export async function stopRegistryTask({
   stdout,
   env,
 }: {
   stdout: NodeJS.WritableStream;
   env?: Record<string, string | undefined>;
 }): Promise<void> {
-  await assertSchtasksAvailable();
-  const taskName = resolveTaskName(env ?? (process.env as Record<string, string | undefined>));
-  const res = await execSchtasks(["/End", "/TN", taskName]);
-  if (res.code !== 0 && !isTaskNotRunning(res)) {
-    throw new Error(`schtasks end failed: ${res.stderr || res.stdout}`.trim());
+  const safeEnv = env ?? (process.env as Record<string, string | undefined>);
+  const pids = await getRunningProcessIds(safeEnv);
+
+  if (pids.length === 0) {
+    stdout.write(`${formatLine("Stopped Registry User Task", "No running process found")}\n`);
+    return;
   }
-  stdout.write(`${formatLine("Stopped Scheduled Task", taskName)}\n`);
+
+  for (const pid of pids) {
+    try {
+      await execFileAsync("taskkill", ["/F", "/PID", pid.toString()], { windowsHide: true });
+    } catch {
+      // Ignore errors killing individual processes
+    }
+  }
+  const taskName = resolveRegistryName(safeEnv);
+  stdout.write(`${formatLine("Stopped Registry User Task", taskName)}\n`);
 }
 
-export async function restartScheduledTask({
+export async function restartRegistryTask({
   stdout,
   env,
 }: {
   stdout: NodeJS.WritableStream;
   env?: Record<string, string | undefined>;
 }): Promise<void> {
-  await assertSchtasksAvailable();
-  const taskName = resolveTaskName(env ?? (process.env as Record<string, string | undefined>));
-  await execSchtasks(["/End", "/TN", taskName]);
-  const res = await execSchtasks(["/Run", "/TN", taskName]);
-  if (res.code !== 0) {
-    throw new Error(`schtasks run failed: ${res.stderr || res.stdout}`.trim());
+  const safeEnv = env ?? (process.env as Record<string, string | undefined>);
+  await stopRegistryTask({ stdout, env: safeEnv });
+
+  const vbsPath = resolveVbsWrapperPath(safeEnv);
+  try {
+    await execFileAsync("wscript.exe", [vbsPath], { windowsHide: true });
+    const taskName = resolveRegistryName(safeEnv);
+    stdout.write(`${formatLine("Restarted Registry User Task", taskName)}\n`);
+  } catch (err) {
+    throw new Error(`Failed to restart task: ${err}`);
   }
-  stdout.write(`${formatLine("Restarted Scheduled Task", taskName)}\n`);
 }
 
-export async function isScheduledTaskInstalled(args: {
-  env?: Record<string, string | undefined>;
-}): Promise<boolean> {
-  await assertSchtasksAvailable();
-  const taskName = resolveTaskName(args.env ?? (process.env as Record<string, string | undefined>));
-  const res = await execSchtasks(["/Query", "/TN", taskName]);
-  return res.code === 0;
-}
-
-export async function readScheduledTaskRuntime(
+export async function readRegistryTaskRuntime(
   env: Record<string, string | undefined> = process.env as Record<string, string | undefined>,
 ): Promise<GatewayServiceRuntime> {
-  try {
-    await assertSchtasksAvailable();
-  } catch (err) {
+  const isInstalled = await isRegistryTaskInstalled({ env });
+  if (!isInstalled) {
     return {
-      status: "unknown",
-      detail: String(err),
+      status: "stopped",
+      missingUnit: true,
     };
   }
-  const taskName = resolveTaskName(env);
-  const res = await execSchtasks(["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
-  if (res.code !== 0) {
-    const detail = (res.stderr || res.stdout).trim();
-    const missing = detail.toLowerCase().includes("cannot find the file");
-    return {
-      status: missing ? "stopped" : "unknown",
-      detail: detail || undefined,
-      missingUnit: missing,
-    };
-  }
-  const parsed = parseSchtasksQuery(res.stdout || "");
-  const statusRaw = parsed.status?.toLowerCase();
-  const status = statusRaw === "running" ? "running" : statusRaw ? "stopped" : "unknown";
+
+  const pids = await getRunningProcessIds(env);
+  const isRunning = pids.length > 0;
+
   return {
-    status,
-    state: parsed.status,
-    lastRunTime: parsed.lastRunTime,
-    lastRunResult: parsed.lastRunResult,
+    status: isRunning ? "running" : "stopped",
+    state: isRunning ? "Running" : "Stopped",
   };
 }
