@@ -2,22 +2,25 @@ export function parseCommandLine(value: string): string[] {
   const args: string[] = [];
   let current = "";
   let inQuotes = false;
-  let escapeNext = false;
 
-  for (const char of value) {
-    if (escapeNext) {
-      current += char;
-      escapeNext = false;
-      continue;
-    }
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i];
+
     if (char === "\\") {
-      escapeNext = true;
+      if (i + 1 < value.length && value[i + 1] === '"') {
+        current += '"';
+        i++;
+        continue;
+      }
+      current += "\\";
       continue;
     }
+
     if (char === '"') {
       inQuotes = !inQuotes;
       continue;
     }
+
     if (!inQuotes && /\s/.test(char)) {
       if (current) {
         args.push(current);
